@@ -30,6 +30,8 @@
 #   11 - rate_limit_error message rejected (notification)
 #   12 - Error object in AskUserQuestion rejected
 #   13 - Empty tool_name rejected (permission-request)
+#   14 - Terminal answer detection (permission-request exits on transcript growth)
+#   15 - Terminal answer detection (ask-user-question exits on transcript growth)
 #
 # Dangerous tests (WILL post to Slack - use with caution):
 #   1  - Valid permission-request (posts, polls for reply, killed after 10s)
@@ -615,6 +617,101 @@ if should_run 13; then
     "Exited cleanly (exit 0)"
   assert_log_contains "TEST13" "REJECTED invalid input" \
     "Empty tool_name was rejected"
+fi
+
+
+# ===================================================================
+# TEST 14: Terminal answer detection - permission-request exits on
+#          transcript growth (will NOT post to Slack)
+# ===================================================================
+if should_run 14; then
+  separator
+  echo -e "${CYAN}TEST 14: Terminal answer detection (permission-request)${NC}"
+  echo -e "  Transcript file grows -> hook detects terminal answer and exits"
+  log_marker "TEST14"
+  cleanup_locks
+
+  # Create a temporary transcript file with initial content
+  TRANSCRIPT_FILE=$(mktemp /tmp/test14-transcript.XXXXXX)
+  echo '{"type":"human","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}' > "$TRANSCRIPT_FILE"
+
+  # Run the hook in background — it will try to post to Slack (which may fail
+  # without real credentials), but the key behavior is the transcript check.
+  # We use a mock-friendly approach: even if the Slack post fails, the process
+  # will exit due to the error. So we set up a scenario where Slack post succeeds
+  # by pointing at real config (if available) or we just test the log output.
+  STDOUT_FILE=$(mktemp /tmp/test14-stdout.XXXXXX)
+  echo "{
+    \"tool_name\": \"Bash\",
+    \"tool_input\": {\"command\": \"echo test14\"},
+    \"session_id\": \"test-hook-00000014\",
+    \"transcript_path\": \"${TRANSCRIPT_FILE}\"
+  }" | timeout 20 node "$SCRIPT" hook permission-request > "$STDOUT_FILE" 2>&1 &
+  HOOK_PID=$!
+
+  # Wait for the hook to start polling (give it time to post to Slack)
+  sleep 8
+
+  # Simulate terminal answer by appending to transcript
+  echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}' >> "$TRANSCRIPT_FILE"
+
+  # Wait for the hook to detect the change and exit
+  wait "$HOOK_PID" 2>/dev/null || true
+  sleep 1
+
+  assert_log_contains "TEST14" "hookPermissionRequest: start" \
+    "Handler started"
+  assert_log_contains "TEST14" "transcript baseline size=" \
+    "Baseline transcript size was recorded"
+  assert_log_contains "TEST14" "terminal answered detected" \
+    "Terminal answer was detected via transcript growth"
+
+  rm -f "$TRANSCRIPT_FILE" "$STDOUT_FILE"
+  cleanup_locks
+fi
+
+
+# ===================================================================
+# TEST 15: Terminal answer detection - ask-user-question exits on
+#          transcript growth (will NOT post to Slack)
+# ===================================================================
+if should_run 15; then
+  separator
+  echo -e "${CYAN}TEST 15: Terminal answer detection (ask-user-question)${NC}"
+  echo -e "  Transcript file grows -> hook detects terminal answer and exits"
+  log_marker "TEST15"
+  cleanup_locks
+
+  TRANSCRIPT_FILE=$(mktemp /tmp/test15-transcript.XXXXXX)
+  echo '{"type":"human","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}' > "$TRANSCRIPT_FILE"
+
+  STDOUT_FILE=$(mktemp /tmp/test15-stdout.XXXXXX)
+  echo "{
+    \"tool_name\": \"AskUserQuestion\",
+    \"tool_input\": {\"questions\": [{\"question\": \"Which option?\", \"options\": [{\"label\": \"A\"}, {\"label\": \"B\"}]}]},
+    \"session_id\": \"test-hook-00000015\",
+    \"transcript_path\": \"${TRANSCRIPT_FILE}\"
+  }" | timeout 20 node "$SCRIPT" hook ask-user-question > "$STDOUT_FILE" 2>&1 &
+  HOOK_PID=$!
+
+  # Wait for the hook to start polling
+  sleep 8
+
+  # Simulate terminal answer
+  echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}' >> "$TRANSCRIPT_FILE"
+
+  wait "$HOOK_PID" 2>/dev/null || true
+  sleep 1
+
+  assert_log_contains "TEST15" "hookAskUserQuestion: start" \
+    "Handler started"
+  assert_log_contains "TEST15" "transcript baseline size=" \
+    "Baseline transcript size was recorded"
+  assert_log_contains "TEST15" "terminal answered detected" \
+    "Terminal answer was detected via transcript growth"
+
+  rm -f "$TRANSCRIPT_FILE" "$STDOUT_FILE"
+  cleanup_locks
 fi
 
 

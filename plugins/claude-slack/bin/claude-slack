@@ -33,6 +33,7 @@ const LOCK_FILE = path.join(CONFIG_DIR, 'hook.lock');        // 同時実行防�
 // 待機中のプロセスが kill された場合、アクティブなプロセスのロックを消さないようにする。
 for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
   process.on(sig, () => {
+    try { fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] SIGNAL RECEIVED: ${sig} (PID=${process.pid})\n`); } catch {}
     for (const lockName of ['permission', 'question']) {
       const lockPath = LOCK_FILE + '.' + lockName;
       try {
@@ -350,6 +351,16 @@ function releaseLock(lockName) {
   try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
 }
 
+/**
+ * トランスクリプトファイルのサイズを取得する。
+ * ポーリング中にサイズが増加したら「ターミナルで回答済み」と判断するために使用。
+ * ファイルが存在しない/パスが未指定の場合は -1 を返す。
+ */
+function getTranscriptSize(transcriptPath) {
+  if (!transcriptPath) return -1;
+  try { return fs.statSync(transcriptPath).size; } catch { return -1; }
+}
+
 /** 文字列を最大長で切り詰める。Slack メッセージの文字数制限に対応するために使用。 */
 function truncate(str, max) {
   if (!str) return '';
@@ -624,10 +635,11 @@ async function slackRequest(method, token, params, httpMethod = 'POST') {
   throw new Error(`Slack API rate limited after 3 retries`);
 }
 
-/** Slack チャンネルにメッセージを投稿する。blocks を指定するとリッチメッセージになる。 */
-async function postMessage(token, channel, text, blocks) {
+/** Slack チャンネルにメッセージを投稿する。blocks を指定するとリッチメッセージになる。threadTs を指定するとスレッド返信になる。 */
+async function postMessage(token, channel, text, blocks, threadTs) {
   const payload = { channel, text };
   if (blocks) payload.blocks = blocks;
+  if (threadTs) payload.thread_ts = threadTs;
   const result = await slackRequest('chat.postMessage', token, payload);
   if (!result.ok) throw new Error(`Slack postMessage error: ${result.error}`);
   return result;
@@ -661,7 +673,7 @@ async function getReactions(token, channel, ts) {
  * ポーリング間隔: 最初の1分は5秒、その後は10秒に緩和する。
  * タイムアウトすると null を返し、ローカルプロンプトにフォールバックする。
  */
-async function pollForReply(token, channel, ts, timeoutMs = 300000) {
+async function pollForReply(token, channel, ts, timeoutMs = 300000, options = {}) {
   const startTime = Date.now();
   let interval = 5000;
   let pollCount = 0;
@@ -671,6 +683,12 @@ async function pollForReply(token, channel, ts, timeoutMs = 300000) {
   while (Date.now() - startTime < timeoutMs) {
     await sleep(interval);
     pollCount++;
+
+    // ターミナルで回答済みかチェック（transcript サイズ増加で検知）
+    if (options.checkTerminalAnswer && options.checkTerminalAnswer()) {
+      debugLog('pollForReply: terminal answered detected');
+      return '__TERMINAL_ANSWERED__';
+    }
 
     try {
       const messages = await getThreadReplies(token, channel, ts);
@@ -709,7 +727,7 @@ async function pollForReply(token, channel, ts, timeoutMs = 300000) {
  * スレッド返信のチェック頻度が低いのは、conversations.replies が Tier 1 のレートリミットのため。
  * タイムアウトすると null を返す。
  */
-async function pollForApproval(token, channel, ts, timeoutMs = 300000) {
+async function pollForApproval(token, channel, ts, timeoutMs = 300000, options = {}) {
   const startTime = Date.now();
   let interval = 5000;
   let pollCount = 0;
@@ -719,6 +737,12 @@ async function pollForApproval(token, channel, ts, timeoutMs = 300000) {
   while (Date.now() - startTime < timeoutMs) {
     await sleep(interval);
     pollCount++;
+
+    // ターミナルで回答済みかチェック（transcript サイズ増加で検知）
+    if (options.checkTerminalAnswer && options.checkTerminalAnswer()) {
+      debugLog('pollForApproval: terminal answered detected');
+      return { decision: 'terminalAnswered', source: 'terminal' };
+    }
 
     // リアクションを毎回チェック（reactions.get は Tier 2+ で比較的余裕がある）
     try {
@@ -935,15 +959,41 @@ async function hookPermissionRequest() {
       `Permission Request: ${toolName}`, blocks
     );
 
+    // ターミナル回答検知: transcript サイズのベースラインを記録
+    const baselineSize = getTranscriptSize(input.transcript_path);
+    debugLog(`hookPermissionRequest: transcript baseline size=${baselineSize}`);
+    const checkTerminalAnswer = () => {
+      if (baselineSize < 0) return false;
+      const currentSize = getTranscriptSize(input.transcript_path);
+      return currentSize > baselineSize;
+    };
+
     // 承認/拒否の応答をポーリングで待つ
     const approval = await pollForApproval(
       config.slack_bot_token, config.channel_id,
-      result.ts, (config.timeout || 300) * 1000
+      result.ts, (config.timeout || 300) * 1000,
+      { checkTerminalAnswer }
     );
 
     if (!approval) {
       // タイムアウト: 何も出力せずに終了し、ローカルのターミナルプロンプトにフォールバック
       debugLog('hookPermissionRequest: timed out, falling back to local prompt');
+      process.exit(0);
+    }
+
+    // ターミナルで回答済みの場合: Slack スレッドに通知して終了
+    if (approval.decision === 'terminalAnswered') {
+      debugLog('hookPermissionRequest: terminal answered, posting notification');
+      try {
+        await postMessage(config.slack_bot_token, config.channel_id,
+          '✅ ターミナルで回答済み',
+          [{ type: 'section', text: { type: 'mrkdwn', text: '✅ ターミナルで回答済み' } }],
+          result.ts
+        );
+      } catch (e) {
+        debugLog(`hookPermissionRequest: failed to post terminal-answered notification: ${e.message}`);
+      }
+      releaseLock('permission');
       process.exit(0);
     }
 
@@ -1075,11 +1125,37 @@ async function hookAskUserQuestion() {
       '❓ Claude needs your input', blocks
     );
 
+    // ターミナル回答検知: transcript サイズのベースラインを記録
+    const baselineSize = getTranscriptSize(input.transcript_path);
+    debugLog(`hookAskUserQuestion: transcript baseline size=${baselineSize}`);
+    const checkTerminalAnswer = () => {
+      if (baselineSize < 0) return false;
+      const currentSize = getTranscriptSize(input.transcript_path);
+      return currentSize > baselineSize;
+    };
+
     // スレッド返信をポーリングして回答を待つ
     const reply = await pollForReply(
       config.slack_bot_token, config.channel_id,
-      result.ts, (config.timeout || 300) * 1000
+      result.ts, (config.timeout || 300) * 1000,
+      { checkTerminalAnswer }
     );
+
+    // ターミナルで回答済みの場合: Slack スレッドに通知して終了
+    if (reply === '__TERMINAL_ANSWERED__') {
+      debugLog('hookAskUserQuestion: terminal answered, posting notification');
+      try {
+        await postMessage(config.slack_bot_token, config.channel_id,
+          '✅ ターミナルで回答済み',
+          [{ type: 'section', text: { type: 'mrkdwn', text: '✅ ターミナルで回答済み' } }],
+          result.ts
+        );
+      } catch (e) {
+        debugLog(`hookAskUserQuestion: failed to post terminal-answered notification: ${e.message}`);
+      }
+      releaseLock('question');
+      process.exit(0);
+    }
 
     if (!reply) {
       debugLog('hookAskUserQuestion: timed out, falling back to local prompt');
